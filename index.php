@@ -1,5 +1,5 @@
 <?php
-// Скрываем ошибки
+// Полное скрытие ошибок для стабильности потока
 error_reporting(0);
 ini_set('display_errors', 0);
 set_time_limit(0);
@@ -17,17 +17,19 @@ if (empty($target_url)) die("No URL");
 $scheme = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? "https" : "http";
 $proxy_self = $scheme . "://" . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'] . "?key=" . urlencode($ACCESS_KEY) . "&url=";
 
-// ОПРЕДЕЛЯЕМ ТИП КОНТЕНТА
-$is_m3u8 = (strpos($target_url, 'm3u8') !== false);
+// Определяем расширение файла для правильных заголовков
+$path_info = pathinfo(parse_url($target_url, PHP_URL_PATH));
+$extension = strtolower($path_info['extension']);
 
-if ($is_m3u8) {
-    // 1. ОБРАБОТКА ПЛЕЙЛИСТА (Текст хорошо сжимается)
-    if (!ob_start("ob_gzhandler")) ob_start(); // Включаем Gzip сжатие для текста
+if ($extension === 'm3u8' || strpos($target_url, 'm3u8') !== false) {
+    // 1. ОБРАБОТКА ПЛЕЙЛИСТА
+    if (!ob_start("ob_gzhandler")) ob_start(); 
 
     $ch = curl_init($target_url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
     curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10); // Чтобы не висело, если источник упал
     $content = curl_exec($ch);
     curl_close($ch);
 
@@ -41,26 +43,29 @@ if ($is_m3u8) {
         if (strpos($line, '#') === 0) {
             $new_content[] = $line;
         } else {
+            // Исправляем путь к сегментам
             $full_url = (strpos($line, 'http') === 0) ? $line : $base_url . $line;
             $new_content[] = $proxy_self . urlencode($full_url);
         }
     }
     header('Content-Type: application/x-mpegURL');
-    // Кэшируем плейлист на короткое время (60 сек), чтобы Cloudflare не частил с запросами
-    header('Cache-Control: public, max-age=60'); 
+    header('Cache-Control: public, max-age=5'); // Плейлисты обновляются часто
     echo implode("\n", $new_content);
     ob_end_flush();
 
 } else {
-    // 2. ПОТОКОВОЕ ПРОКСИРОВАНИЕ ВИДЕО (.ts сегменты)
-    header('Content-Type: video/mp2t');
+    // 2. ПОТОКОВОЕ ПРОКСИРОВАНИЕ ВИДЕО (.ts, .mp4 и др.)
+    // Устанавливаем тип контента в зависимости от расширения
+    $ctype = ($extension === 'ts') ? 'video/mp2t' : 'video/mpeg';
+    header("Content-Type: $ctype");
     
-    // ВАЖНО: Разрешаем Cloudflare кэшировать видео-сегменты на 24 часа.
-    // Если 10 человек смотрят один канал, Render отдаст сегмент 1 раз, а Cloudflare — 10 раз.
-    header('Cache-Control: public, max-age=86400'); 
+    // ВАЖНО: Кеширование на стороне клиента (браузера)
+    // Поможет, если пользователь перематывает видео назад — Render не будет тратить трафик повторно
+    header('Cache-Control: public, max-age=3600'); 
+    header('Access-Control-Allow-Origin: *'); // Разрешаем всем плеерам
     header_remove('Pragma');
 
-    // Отключаем буферизацию PHP для мгновенного потока
+    // Отключаем всё сжатие и буферизацию для видео
     @ini_set('zlib.output_compression', 'Off');
     while (ob_get_level()) ob_end_clean();
 
@@ -68,11 +73,11 @@ if ($is_m3u8) {
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    curl_setopt($ch, CURLOPT_BUFFERSIZE, 256000); 
+    curl_setopt($ch, CURLOPT_BUFFERSIZE, 524288); // Увеличили буфер до 512KB для стабильности
 
-    // Передаем данные чанками
     curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($ch, $data) {
         echo $data;
+        if (connection_aborted()) return 0; // Останавливаем закачку, если юзер закрыл плеер
         flush(); 
         return strlen($data);
     });
